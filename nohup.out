@@ -1,0 +1,18 @@
+INFO:     Started server process [52024]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:39744 - "POST /trigger-automation HTTP/1.1" 404 Not Found
+INFO:     Started server process [186086]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8000): address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     24.23.209.81:57613 - "GET /docs HTTP/1.1" 200 OK
+INFO:     24.23.209.81:57613 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     24.23.209.81:57642 - "GET /tailor-text HTTP/1.1" 404 Not Found
+INFO:     24.23.209.81:57642 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     24.23.209.81:57670 - "GET /tailor-text HTTP/1.1" 404 Not Found
+INFO:     24.23.209.81:57670 - "GET /tailor-text HTTP/1.1" 404 Not Found
+INFO:     81.168.83.103:50004 - "GET /.env.production HTTP/1.0" 404 Not Found
