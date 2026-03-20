@@ -1,177 +1,204 @@
-Tailor Service
-A standalone Python microservice that optimizes resumes for specific job descriptions. This is the Tailor layer of the ResuMap automation pipeline.
+# ResuMap — AI Job Application Automation Engine
 
-Given a PDF resume and a job description, it returns an optimized PDF and a full analysis — ready for the Applier to use.
+ResuMap is an end-to-end job application automation system running on an Azure VM. It finds relevant job openings, tailors your resume for each one, and autonomously fills and submits the application forms — including handling React-Select dropdowns, file uploads, email verification codes, and EEO fields.
 
-How it fits in the pipeline
-Scout (Azure VM)
-    → finds top 10 jobs for the user
-    → calls Tailor for each job
-Tailor (this service, Azure VM)
-    → extracts text from PDF resume
-    → calls OpenAI (3 times) to optimize resume for the job
-    → generates a polished PDF
-    → returns PDF + analysis JSON
-Applier (Azure VM)
-    → receives optimized PDFs + analysis from Tailor
-    → uses ResuMap webhook API to log applications
-    → autonomously submits applications
-Prerequisites
-Python 3.11+
-pip
-An OpenAI API key (GPT-4o access required)
-Setup
-1. Copy the folder to your VM
-scp -r tailor-service/ user@your-vm-ip:~/tailor-service/
-Or clone/pull the full repo and navigate to tailor-service/.
+---
 
-2. Install dependencies
-cd tailor-service
-pip install -r requirements.txt
-3. Configure environment variables
-cp .env.example .env
-nano .env
-Fill in:
+## System Architecture
 
-OPENAI_API_KEY=sk-your-key-here
-TAILOR_SECRET=a-long-random-secret-shared-with-scout-and-applier
-PORT=8000
-TAILOR_SECRET is a shared secret that Scout and Applier must send in the X-Tailor-Secret header on every request. Pick any long random string.
+```
+Replit Dashboard (User-facing web app)
+    │
+    │  GET /api/webhooks/users/active  (fetch active users + profiles)
+    │  POST /api/webhooks/application  (push completed application results)
+    ▼
+Azure VM  ──────────────────────────────────────────────────────────────
+    │
+    ├── scout.py        Finds jobs, scores them, orchestrates the pipeline
+    ├── tailor.py       Optimizes the resume text for each specific job
+    ├── generate_pdf.py Produces a polished PDF from the optimized resume
+    └── executor.py     Autonomously fills and submits the application form
+```
 
-4. Run the service
-uvicorn server:app --host 0.0.0.0 --port 8000
-For production with multiple workers:
+**Flow per user per run:**
 
-uvicorn server:app --host 0.0.0.0 --port 8000 --workers 2
-Running as a systemd service (Azure VM)
-Create /etc/systemd/system/tailor.service:
+1. **Scout** fetches active users and their profiles from Replit
+2. **Scout** searches Adzuna for relevant job listings, filters to supported ATS platforms (Greenhouse, Lever, Ashby), scores each job for fit using Azure OpenAI
+3. Already-applied jobs are filtered out (deduplication via `applications_log.jsonl`) **before** top-N selection so the pipeline always fills the quota with fresh candidates
+4. For each top job, **Tailor** rewrites the resume content to match the job description and **generate_pdf** renders it to PDF
+5. **Executor** navigates to the job application form using Playwright + Stagehand, fills it end-to-end, and submits
+6. The result (application data + Q&A + match score) is POSTed to the Replit dashboard webhook
 
-[Unit]
-Description=Tailor Resume Optimization Service
-After=network.target
-[Service]
-Type=simple
-User=azureuser
-WorkingDirectory=/home/azureuser/tailor-service
-EnvironmentFile=/home/azureuser/tailor-service/.env
-ExecStart=/usr/bin/python3 -m uvicorn server:app --host 0.0.0.0 --port 8000 --workers 2
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-Then enable and start it:
+---
 
-sudo systemctl daemon-reload
-sudo systemctl enable tailor
-sudo systemctl start tailor
-sudo systemctl status tailor
-API Reference
-GET /health
-Liveness check.
+## Key Components
 
-curl http://localhost:8000/health
-Response:
+### `scout.py`
+- Fetches user profiles and resumes from Replit via `GET /api/webhooks/users/active`
+- Searches Adzuna API for job listings matching the user's target role and location
+- Resolves redirect URLs to find the actual ATS (Greenhouse, Lever, Ashby, Workable)
+- Scores each job 0–100 using Azure OpenAI (GPT-4.1) against the user's resume
+- Applies domain bonuses/penalties: gold-standard ATS platforms get +10, scrapers get -10
+- Filters already-applied jobs using `applications_log.jsonl` **before** selecting top-N
+- Calls `tailor.py` → `generate_pdf.py` → `executor.py` for each selected job
+- Passes `match_score`, `relevance_explanation`, and `user_id` to executor for webhook reporting
 
-{"status": "ok", "service": "tailor"}
-POST /extract
-Extract raw text from a PDF resume (useful for debugging).
+### `executor.py`
+The core automation engine. Runs a headless Chromium browser with Playwright and Stagehand (AI-powered browser control). Key capabilities:
 
-curl -X POST http://localhost:8000/extract \
-  -H "X-Tailor-Secret: your-secret-here" \
-  -F "pdf_file=@/path/to/resume.pdf"
-Response:
+- **Phase 0 — ATS URL resolution:** Queries Greenhouse, Lever, and Ashby public APIs to find the direct application form URL, bypassing Adzuna redirect chains
+- **Phase 1 — Identity fields:** Natively fills first name, last name, email, phone, LinkedIn, website using predictable `<input>` selectors across all ATS platforms
+- **Phase 2 — Resume upload:** Detects file input elements and uploads the tailored PDF natively
+- **Phase 3 — React-Select dropdowns:** Discovers all unselected React-Select containers, opens each to read available options, sends all fields in a single LLM call (OpenAI), then clicks each answer natively via Playwright — avoiding Stagehand's false-success problem with React synthetic events. Covers EEO fields (gender, race, veteran status, disability) with sensible defaults when profile values are absent.
+- **Phase 4 — Text inputs:** Finds empty text inputs (skipping identity/React-Select internals), sends all fields to LLM for answers, fills natively with realistic typing delay
+- **Phase 5 — City autocomplete:** Handles Greenhouse's async geocode API — types, waits 2.2s for API response, clicks the best matching suggestion
+- **Phase 6 — Submit:** Presses Escape to close any open dropdowns, tries native Playwright button click, falls back to Stagehand act
+- **Phase 7 — Email verification:** Polls Gmail via IMAP for Greenhouse's post-submit security code (handles both numeric and alphanumeric codes), fills it natively into the verification fieldset
+- **Phase 8 — Logging:** Appends result to `applications_log.jsonl` for deduplication; POSTs full payload (Q&A, score, status) to Replit webhook at `POST /api/webhooks/application`
 
-{
-  "text": "John Smith\njohn@example.com | +1 (555) 000-0000\n\nEXPERIENCE\n...",
-  "layout": [...]
-}
-Error responses:
+### `tailor.py`
+- Extracts structured data from the PDF resume using pdfplumber
+- Makes 3 sequential OpenAI calls to: (1) score and analyze fit, (2) rewrite bullet points for the target role, (3) produce a final structured JSON resume
+- Returns a structured resume dict ready for PDF generation
 
-400 — not a PDF, unreadable PDF, or not a resume
-401 — missing or wrong X-Tailor-Secret
-POST /tailor
-The main endpoint. Optimizes a resume for a specific job description.
+### `generate_pdf.py`
+- Renders the structured resume JSON into a polished, ATS-friendly PDF using ReportLab
+- Uses the Inter font family for clean typesetting
+- Outputs to the `resumes/` directory with naming convention `{userId}_{Company}_{Role}.pdf`
 
-curl -X POST http://localhost:8000/tailor \
-  -H "X-Tailor-Secret: your-secret-here" \
-  -F "pdf_file=@/path/to/resume.pdf" \
-  -F "job_description=We are hiring a Senior Product Manager to lead our growth team. Responsibilities include defining product strategy, working with engineering and design, and driving key metrics. Requirements: 5+ years PM experience, strong analytical skills, experience with B2B SaaS products."
-Response:
+### `server.py` / `main.py`
+- FastAPI service exposing `/health`, `/extract`, and `/tailor` endpoints
+- Used when tailor runs as a standalone microservice (alternative to in-process calls)
+
+---
+
+## Deduplication
+
+Every application attempt is appended to `applications_log.jsonl` (one JSON line per attempt):
+
+```json
+{"ts": 1773779529, "user_email": "user@example.com", "job_url": "https://...", "company": "Acme", "job_title": "Senior PM", "submitted": true}
+```
+
+On each scout run, the log is read **before** top-N selection. Jobs with `submitted: true` for the same user are filtered out of the scored pool so the top-N always draws from fresh candidates. Only `submitted: true` records are skipped — failed attempts are retried on the next run.
+
+---
+
+## Replit Webhook Integration
+
+After each successful submission, executor POSTs to the Replit dashboard:
+
+```
+POST {REPLIT_URL}/api/webhooks/application
+X-Webhook-Secret: <secret>
 
 {
-  "pdf_base64": "JVBERi0xLjQK...",
-  "filename": "resume_optimized.pdf",
-  "analysis": {
-    "overallScore": 78,
-    "missingSkills": ["B2B SaaS", "growth metrics", "stakeholder alignment"],
-    "suggestedChanges": [
-      {
-        "original": "Led product roadmap for mobile app",
-        "improved": "Drove product strategy and roadmap for mobile app, increasing user retention by 23%",
-        "reason": "Adds quantified impact and aligns with 'driving key metrics' requirement"
-      }
-    ],
-    "structuredResume": { ... },
-    "fullOptimizedText": "John Smith\n..."
-  }
-}
-To decode and save the PDF:
-
-import base64
-with open("optimized.pdf", "wb") as f:
-    f.write(base64.b64decode(response["pdf_base64"]))
-Error responses:
-
-400 — not a PDF, unreadable PDF, not a resume, or JD too short/unrecognized
-401 — missing or wrong X-Tailor-Secret
-500 — OpenAI failure or PDF generation failure
-Integration guide (for Scout/Applier)
-Scout finds a relevant job and has the user's resume PDF path
-Scout calls Tailor:
-import httpx, base64
-async with httpx.AsyncClient(timeout=120) as client:
-    with open("resume.pdf", "rb") as f:
-        response = await client.post(
-            "http://tailor-vm-ip:8000/tailor",
-            headers={"X-Tailor-Secret": TAILOR_SECRET},
-            files={"pdf_file": ("resume.pdf", f, "application/pdf")},
-            data={"job_description": job_description_text},
-        )
-    result = response.json()
-    pdf_bytes = base64.b64decode(result["pdf_base64"])
-    match_score = result["analysis"]["overallScore"]
-Applier receives the optimized PDF and match score, then applies to the job and calls the ResuMap webhook to log it:
-POST https://resumap-app.replit.app/api/webhooks/application
-X-Webhook-Secret: <webhook_secret>
-{
-  "userId": 42,
-  "jobTitle": "Senior PM",
-  "company": "Acme Corp",
-  "matchScore": 78,
+  "userId": "42",
+  "jobTitle": "Staff Product Manager",
+  "company": "Calendly",
   "status": "Applied",
-  "jobUrl": "https://..."
+  "jobUrl": "https://job-boards.greenhouse.io/calendly/jobs/...",
+  "matchScore": 87,
+  "relevanceExplanation": "Strong PM background with AI product experience...",
+  "questionsAnswers": [
+    {"question": "Are you authorized to work in the US?", "answer": "Yes"},
+    {"question": "Will you require sponsorship?", "answer": "No"}
+  ]
 }
-Troubleshooting
-Error	Cause	Fix
-OPENAI_API_KEY not found	Env var not set	Add to .env and restart
-401 Invalid X-Tailor-Secret	Wrong secret	Make sure Scout/Applier use the same TAILOR_SECRET
-400 This doesn't appear to be a resume	Uploaded wrong PDF	Check that the PDF has work experience, education, skills sections
-400 This doesn't look like a job description	JD too short or generic	Paste the full job posting including responsibilities and requirements
-500 AI failed to generate structured resume	OpenAI returned malformed JSON	Retry — this is transient
-openai.RateLimitError	OpenAI quota exceeded	Check your OpenAI account usage/billing
-PDF generation crashes	Missing font files	Ensure fonts/ folder is present with all Inter .ttf files
-File structure
+```
+
+Only successful submissions (`submitted: true`) trigger the webhook — failed attempts are not reported.
+
+Active users are fetched via:
+
+```
+GET {REPLIT_URL}/api/webhooks/users/active
+X-Webhook-Secret: <secret>
+```
+
+---
+
+## Environment Variables (`.env`)
+
+```env
+# Replit integration
+REPLIT_URL=https://resumap.site
+WEBHOOK_SECRET=your-webhook-secret
+
+# Azure OpenAI (used by scout + tailor for scoring and resume optimization)
+AZURE_OPENAI_KEY=...
+AZURE_OPENAI_ENDPOINT=https://your-resource.cognitiveservices.azure.com/...
+AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4.1
+AZURE_OPENAI_VERSION=2024-02-01
+
+# OpenAI (used by executor for React-Select + text field LLM passes)
+EXECUTOR_OPENAI_KEY=sk-...
+EXECUTOR_MODEL=gpt-4o-mini
+
+# Adzuna job search API
+ADZUNA_APP_ID=...
+ADZUNA_APP_KEY=...
+
+# Gmail IMAP (for reading Greenhouse email verification codes)
+GMAIL_APP_PASSWORD=...
+```
+
+---
+
+## Supported ATS Platforms
+
+| Platform | Apply URL Pattern | Notes |
+|----------|-------------------|-------|
+| Greenhouse | `job-boards.greenhouse.io` | Most common; supports email verification gate |
+| Lever | `jobs.lever.co` | No verification gate |
+| Ashby | `jobs.ashbyhq.com` | Similar to Greenhouse |
+| Workable | `apply.workable.com` | Basic support |
+
+---
+
+## File Structure
+
+```
 tailor-service/
-├── server.py          # FastAPI app — /health, /extract, /tailor endpoints
-├── tailor.py          # 3-call OpenAI optimization pipeline
-├── extract.py         # PDF text extraction (pdfplumber + PyMuPDF)
-├── generate_pdf.py    # PDF generation (ReportLab + Inter fonts)
-├── fonts/             # Inter font family TTF files
-│   ├── Inter-Regular.ttf
-│   ├── Inter-Bold.ttf
-│   ├── Inter-Italic.ttf
-│   ├── Inter-BoldItalic.ttf
-│   └── Inter-Medium.ttf
-├── requirements.txt   # Python dependencies
-├── .env.example       # Environment variable template
-└── README.md          # This file
+├── scout.py              # Job search, scoring, deduplication, pipeline orchestration
+├── executor.py           # Browser automation: form fill + submit + webhook reporting
+├── tailor.py             # Resume optimization (3-call OpenAI pipeline)
+├── generate_pdf.py       # PDF rendering (ReportLab + Inter fonts)
+├── server.py             # FastAPI microservice wrapper for tailor endpoints
+├── main.py               # Alternative entry point / API server
+├── extract.py            # PDF text extraction utilities
+├── apply.py              # Legacy Skyvern-based applier (superseded by executor.py)
+├── fonts/                # Inter font family TTF files
+├── requirements.txt      # Python dependencies
+├── .env.example          # Environment variable template
+└── README.md             # This file
+```
+
+---
+
+## Running the Pipeline
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+playwright install chromium
+
+# Single full run (scout → tailor → executor for all active users)
+python scout.py
+
+# Run as a background service
+nohup python scout.py >> output.log 2>&1 &
+```
+
+---
+
+## Dependencies
+
+- **Playwright** — headless browser automation
+- **Stagehand** — AI-powered browser control layer (Playwright wrapper)
+- **playwright-stealth** — anti-bot fingerprint evasion
+- **OpenAI / Azure OpenAI** — LLM calls for job scoring, dropdown answers, text field answers
+- **pdfplumber / PyMuPDF** — PDF text extraction
+- **ReportLab** — PDF generation
+- **FastAPI / Uvicorn** — microservice API layer
+- **Requests** — HTTP client for Adzuna API and Replit webhooks

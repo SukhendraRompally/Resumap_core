@@ -1,5 +1,28 @@
+# Python
 venv/
 __pycache__/
 *.pyc
-*.log
+*.pyo
+*.egg-info/
 .env
+
+# Runtime output directories (generated per-run, not source code)
+applications/
+resumes/
+debug/
+
+# Log files and run artifacts
+*.log
+nohup.out
+output.log
+applications_log.jsonl
+stagehand_fallback.png
+
+# Font archive (fonts/ TTF files are committed, not the zip)
+Inter-3.19.zip
+
+# Test artifacts
+test_apply.log
+
+# Virtual environments
+.venv/

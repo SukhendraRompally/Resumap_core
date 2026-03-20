@@ -181,19 +181,21 @@ When a role has named sub-sections (e.g. "Chezuba AI Products", "Corporate Socia
 - Sub-section items: {{ "title": "Chezuba AI Products", "isSubsection": true, "bullets": [...the bullets for that sub-section...] }}
 
 ABSOLUTE RULES:
-1. BULLET HANDLING: I have numbered every original bullet as [B1] through [B{len(bullet_lines)}]. For EVERY bullet you MUST do one of the following:
-   a) DIRECTLY RELEVANT to the job description → Optimize it: reword to incorporate relevant keywords, skills, and terminology from the job description while preserving the original meaning, metrics, and achievements.
-   b) NOT DIRECTLY RELEVANT to the job description → Soft Align it: rewrite the bullet to emphasize universal professional skills (leadership, efficiency, communication, problem-solving, stakeholder management, cross-functional collaboration, impact) rather than technical keywords. Keep the original facts, metrics, and meaning intact.
-   For each bullet, include a "softAligned" array listing bullet numbers that were soft-aligned rather than directly optimized (e.g. "softAligned": ["B3", "B7"]).
+1. BULLET PROCESSING (INTERNAL LOGIC):
+   - For job-relevant accomplishments: Rewrite using keywords from the Job Description.
+   - For all other accomplishments: Rewrite as high-level professional achievements (leadership, impact, problem-solving). 
+   - DO NOT include labels, categories, or bracketed references (like [B1]) in the final text.
 2. TWO-PAGE LIMIT: The original resume has {experience_bullet_count} experience bullets (plus {skills_bullet_count} skills entries that will become label/value pairs, not bullets). A standard 2-page resume fits roughly 28-34 experience bullet points.
-   {two_page_rule}
+   {two_page_rule}. If the current bullet count exceeds 34, you MUST selectively merge the 'Generalized' (non-relevant) bullets into single, high-impact compound sentences to save space. Prioritize keeping 100% of 'Directly Optimized' bullets while condensing the rest.
 3. PRESERVE EXACTLY: name, contact info (including full URLs like https://www.linkedin.com/in/...), dates, company names, job titles, locations, education
 4. OPTIMIZE: Make the job-relevant bullets shine the brightest with strong keyword alignment. Soft-aligned bullets should still read professionally but don't need heavy keyword insertion.
 5. DO NOT FABRICATE: Never invent information, metrics, or claims not in the original
 6. SECTION ORDER: Keep all sections in their original order
 7. Use "experience" for work, "education" for education, "skills" for skills, "generic" for others
 8. NEVER USE "N/A": If any field (dateRange, location, subtitle, etc.) has no data in the original resume, omit the field entirely or use an empty string "". Never output "N/A", "n/a", or similar placeholders.
-9. NO TAGS OR REFERENCES IN OUTPUT: Do NOT include any bullet references like [B1], [optimized bullet for B1], [softAligned bullet for B7], or any bracketed annotations in your output text. The bullet numbers are for your reference only — the output must be clean, professional text with zero annotations or meta-commentary."""
+9. STRICT CONTENT BAN: The terms "soft-aligned", "soft aligned", "optimized", "directly relevant", or any reference to "B1", "B2", etc., are STRICTLY FORBIDDEN from appearing in the output. The final result must be a clean, ready-to-print document. If any of these internal processing terms appear in a bullet point, the output is considered a failure.
+10. NO INTERNAL LABELS: Ensure that internal processing terms like 'softAligned', 'Directly Relevant', or 'Optimized' do not appear in the final resume content. Every bullet must read as a standard, professional accomplishment.
+11. PUNCTUATION & SYMBOLS: Use standard hyphens (-) for date ranges. NEVER use em-dashes (—) or en-dashes (–). Use standard bullet points (• or -). Ensure the text is clean and lacks any AI-typical flourishes or meta-commentary like "Soft Aligned" or "Aligned for [Company]"""
 
 
 def _build_call2_user_prompt(

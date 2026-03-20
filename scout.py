@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from openai import AzureOpenAI
 import time
 import tailor
-import apply
+import executor
 import generate_pdf
 import subprocess
 import asyncio
@@ -34,17 +34,142 @@ DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 
 # ===== INTELLIGENCE LAYER: JOB QUALITY FILTERING =====
 
-def get_actual_destination(adzuna_url):
-    """Follow redirects to get the real job posting URL"""
+def _extract_ats_url(data, depth=0):
+    """Recursively search a JSON structure for a known ATS / employer URL.
+
+    Adzuna embeds job data including the outbound apply URL in its page's
+    __NEXT_DATA__ blob.  This helper walks that blob and returns the first
+    URL that belongs to a known ATS domain.
+    """
+    if depth > 15:
+        return None
+    ats_domains = [
+        'greenhouse.io', 'lever.co', 'ashbyhq.com', 'workable.com',
+        'breezy.hr', 'myworkdayjobs.com', 'smartrecruiters.com',
+        'hire.withgoogle.com', 'taleo.net', 'icims.com', 'jobvite.com',
+        'bamboohr.com', 'recruitee.com', 'pinpointhq.com', 'jobs.lever.co',
+        'boards.greenhouse.io', 'apply.workable.com', 'careers.', 'jobs.',
+    ]
+    if isinstance(data, str):
+        if data.startswith('http') and 'adzuna.com' not in data.lower():
+            if any(ats in data.lower() for ats in ats_domains):
+                return data.lower()
+    elif isinstance(data, dict):
+        for v in data.values():
+            result = _extract_ats_url(v, depth + 1)
+            if result:
+                return result
+    elif isinstance(data, list):
+        for item in data:
+            result = _extract_ats_url(item, depth + 1)
+            if result:
+                return result
+    return None
+
+
+def _ats_lookup(company_name: str, job_title: str) -> str | None:
+    """Try to find the job directly on Greenhouse, Lever, or Ashby public APIs.
+
+    These APIs are completely public, require no authentication, and have no
+    bot-detection — unlike Adzuna's redirect URL which requires a real browser
+    session to follow. This is far more reliable than trying to scrape Adzuna.
+    """
+    import re as _re
+
+    # Normalise company name → URL slug candidates
+    name = company_name.strip()
+    slug_base = _re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+    slug_nohyphen = slug_base.replace('-', '')
+    slug_underscore = slug_base.replace('-', '_')
+    slugs = list(dict.fromkeys([slug_base, slug_nohyphen, slug_underscore]))  # dedupe
+
+    _stop = {'a', 'an', 'the', 'of', 'for', 'in', 'at', 'and', 'or', 'to', 'on',
+              'is', 'are', 'be', 'its', '-', '&'}
+
+    def _title_match(a, b):
+        a, b = a.lower(), b.lower()
+        if a in b or b in a:
+            return True
+        # Keyword overlap: 2+ meaningful words in common
+        words_a = {w for w in _re.split(r'[\W_]+', a) if len(w) > 2 and w not in _stop}
+        words_b = {w for w in _re.split(r'[\W_]+', b) if len(w) > 2 and w not in _stop}
+        common = words_a & words_b
+        return len(common) >= 2
+
+    headers = {"User-Agent": "Mozilla/5.0 ResuMapBot/1.0"}
+    timeout = 8
+
+    for slug in slugs:
+        # ── Greenhouse ──────────────────────────────────────────────────────
+        try:
+            r = requests.get(
+                f"https://boards.greenhouse.io/v1/boards/{slug}/jobs?content=true",
+                headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                for job in r.json().get('jobs', []):
+                    if _title_match(job_title, job.get('title', '')):
+                        url = job.get('absolute_url', '')
+                        if url:
+                            return url
+        except Exception:
+            pass
+
+        # ── Lever ────────────────────────────────────────────────────────────
+        try:
+            r = requests.get(
+                f"https://api.lever.co/v0/postings/{slug}?mode=json",
+                headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                for job in r.json():
+                    if _title_match(job_title, job.get('text', '')):
+                        url = job.get('hostedUrl', '')
+                        if url:
+                            return url
+        except Exception:
+            pass
+
+        # ── Ashby ────────────────────────────────────────────────────────────
+        try:
+            r = requests.get(
+                f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=false",
+                headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                for job in r.json().get('jobPostings', []):
+                    if _title_match(job_title, job.get('title', '')):
+                        return f"https://jobs.ashbyhq.com/{slug}/{job['id']}"
+        except Exception:
+            pass
+
+    return None
+
+
+def get_actual_destination(adzuna_url, company_name="", job_title=""):
+    """Return the real employer job URL.
+
+    Primary strategy: query Greenhouse / Lever / Ashby public APIs by company
+    name — these require no proxy, no browser session, no bot-detection bypass.
+
+    Fallback: follow the Adzuna redirect with a plain HTTP request (works for
+    a small subset of jobs that do a direct HTTP 302 instead of JS redirect).
+    """
+    # Strategy 1: ATS public API lookup (most reliable, no bot detection)
+    if company_name and job_title:
+        ats_url = _ats_lookup(company_name, job_title)
+        if ats_url:
+            return ats_url
+
+    # Strategy 2: Simple HTTP follow-redirect (works when Adzuna does a 302)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        # Use stream=True to avoid downloading the full page content
-        with requests.get(adzuna_url, headers=headers, allow_redirects=True, timeout=8, stream=True) as r:
-            return r.url.lower()
-    except Exception as e:
-        return adzuna_url.lower()
+        r = requests.get(adzuna_url, headers=headers, allow_redirects=True, timeout=10)
+        if "adzuna.com" not in r.url.lower():
+            return r.url
+    except Exception:
+        pass
+
+    return adzuna_url
 
 
 # ===== LAYER 1: JOB DISCOVERY =====
@@ -103,8 +228,8 @@ def fetch_jobs(profile):
                 # Layer 1: Meta filter
                 is_junk_meta = any(term in company_name or term in redirect_url for term in blacklisted_domains)
 
-                # Layer 2: Sniffer - follow redirect to get real URL
-                final_url = get_actual_destination(redirect_url)
+                # Layer 2: Sniffer - look up ATS directly or follow redirect
+                final_url = get_actual_destination(redirect_url, company_name=company_info.get('display_name', ''), job_title=title)
                 is_junk_sniff = any(term in final_url for term in blacklisted_domains)
 
                 # Debug logging
@@ -234,7 +359,7 @@ Return ONLY a JSON object with this exact format:
 
 def run_automation_pipeline(extracted_text, user_profile, user_id, final_rankings=None):
     """
-    Main automation pipeline: Score jobs → Tailor resumes → Generate PDFs → Apply via Skyvern
+    Main automation pipeline: Score jobs → Tailor resumes → Generate PDFs → Execute application via Stagehand executor
     
     Args:
         extracted_text: User's resume text
@@ -303,6 +428,36 @@ def run_automation_pipeline(extracted_text, user_profile, user_id, final_ranking
 
         # Sort all by weighted score and pick top 10
         scored_jobs.sort(key=lambda x: x['weighted_score'], reverse=True)
+
+        # --- Deduplication: remove already-applied jobs BEFORE top-N selection ---
+        _apps_log_path = os.path.join(os.path.dirname(__file__), "applications_log.jsonl")
+        _applied_keys = set()   # (company_lower, title_lower) for submitted jobs
+        _applied_urls = set()   # exact ATS URLs for belt-and-suspenders check later
+        _user_email_dedup = (user_profile or {}).get("email", "")
+        if _user_email_dedup and os.path.exists(_apps_log_path):
+            with open(_apps_log_path) as _alf:
+                for _line in _alf:
+                    try:
+                        _e = json.loads(_line.strip())
+                        if _e.get("user_email") == _user_email_dedup and _e.get("submitted"):
+                            _applied_keys.add((_e.get("company", "").strip().lower(),
+                                               _e.get("job_title", "").strip().lower()))
+                            _applied_urls.add(_e.get("job_url", ""))
+                    except Exception:
+                        pass
+
+        if _applied_keys:
+            _fresh_jobs = []
+            for _sj in scored_jobs:
+                _sj_company = _sj["job"].get("company", {}).get("display_name", "").strip().lower()
+                _sj_title   = _sj["job"].get("title", "").strip().lower()
+                if (_sj_company, _sj_title) in _applied_keys:
+                    print(f"  ⏭️ Already applied: {_sj['job'].get('title')} @ {_sj['job'].get('company', {}).get('display_name')} — skipping")
+                    continue
+                _fresh_jobs.append(_sj)
+            scored_jobs = _fresh_jobs
+        # -------------------------------------------------------------------------
+
         top_jobs = scored_jobs[:3]
         
         print(f"🏆 Selected {len(top_jobs)} top matches after weighting")
@@ -348,12 +503,17 @@ def run_automation_pipeline(extracted_text, user_profile, user_id, final_ranking
             # Create manifest in applications folder
             manifest_filename = f"{user_id}_{clean_company}_{clean_title}.json"
             manifest_path = os.path.join(applications_dir, manifest_filename)
+            # the Adzuna API returns a `redirect_url` that points to an
+            # intermediate tracker page. earlier we added `clean_url` during
+            # filtering which follows the redirect and gives us the actual job
+            # board URL. use that for both the manifest and the executor call.
+            actual_url = job.get('clean_url') or job.get('redirect_url')
             manifest_data = {
                 "USER_ID": user_id,
                 "job_id": job.get('id'),
                 "title": job.get('title'),
                 "company": company,
-                "url": job.get('redirect_url'),
+                "url": actual_url,
                 "resume_path": file_path,
                 "score": score,
                 "reason": item.get('reason', '')
@@ -365,17 +525,33 @@ def run_automation_pipeline(extracted_text, user_profile, user_id, final_ranking
             final_manifest_list.append(manifest_data)
             print(f"✅ Success: Tailored and Created Manifest for {job.get('title')}")
             
-            # Trigger Skyvern apply for this job
+            # Trigger Stagehand executor for this job (replaces Skyvern)
             try:
-                asyncio.run(apply.trigger_skyvern_apply(
-                    job_url=job.get('redirect_url'),
-                    pdf_path=file_path,
+                # pass the *clean* URL rather than the raw redirect. the
+                # previous behaviour navigated to Adzuna's proxy/landing page
+                # and Stagehand would never make it to the real job board.
+                actual_url = job.get('clean_url') or job.get('redirect_url')
+                # Secondary URL-based dedup guard (belt-and-suspenders)
+                if actual_url in _applied_urls:
+                    print(f"  ⏭️ URL already applied: {actual_url} — skipping")
+                    continue
+                success = asyncio.run(executor.run_executor(
+                    job_url=actual_url,
                     user_profile=user_profile,
-                    job_description=description
+                    local_pdf_path=file_path,
+                    company_name=company,
+                    job_title=job_title,
+                    resume_text=extracted_text,
+                    match_score=int(score),
+                    relevance_explanation=item.get('reason', ''),
+                    user_id=str(user_id),
                 ))
-                print(f"🚀 Skyvern apply triggered for {job.get('title')}")
+                if success:
+                    print(f"🚀 Executor applied for {job.get('title')}")
+                else:
+                    print(f"⚠️ Executor reported failure for {job.get('title')}")
             except Exception as e:
-                print(f"⚠️ Skyvern apply warning for {job.get('title')}: {e}")
+                print(f"⚠️ Executor warning for {job.get('title')}: {e}")
             
         except Exception as e:
             print(f"❌ Tailoring failed for {job.get('title')}: {e}")
